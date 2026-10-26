@@ -23,7 +23,8 @@ import Network
 actor WebSocket: Loggable, AsyncSequence {
     typealias Element = URLSessionWebSocketTask.Message
 
-    private let connection: NWConnection
+    /// Not private: a test holds it weakly to see it freed.
+    let connection: NWConnection
     private static let queue = DispatchQueue(label: "LiveKitSDK.webSocket")
 
     init(url: URL, token: String, connectOptions: ConnectOptions?) async throws {
@@ -31,8 +32,9 @@ actor WebSocket: Loggable, AsyncSequence {
         webSocket.autoReplyPing = true
         webSocket.maximumMessageSize = 16 << 20
         webSocket.setAdditionalHeaders([("Authorization", "Bearer \(token)")])
+        let timeout = connectOptions?.socketConnectTimeoutInterval ?? .defaultSocketConnect
         let tcp = NWProtocolTCP.Options()
-        tcp.connectionTimeout = Int(connectOptions?.socketConnectTimeoutInterval ?? .defaultSocketConnect)
+        tcp.connectionTimeout = Int(timeout)
         let parameters = url.scheme == "wss" ? NWParameters(tls: NWProtocolTLS.Options(), tcp: tcp) : NWParameters(tls: nil, tcp: tcp)
         parameters.serviceClass = .responsiveData
         #if os(iOS) || os(visionOS)
@@ -56,6 +58,12 @@ actor WebSocket: Loggable, AsyncSequence {
                     }
                 }
                 connection.start(queue: Self.queue)
+                // A peer that closes instead of answering the upgrade (a proxy whose upstream is down) leaves the
+                // connection in .preparing for 60 s without a word; URLSession failed it at once.
+                // Weakly: a socket closed before the deadline is not held until it.
+                Self.queue.asyncAfter(deadline: .now() + timeout) { [weak connection] in
+                    if opened.resume(LiveKitError(.timedOut, message: "WebSocket upgrade not answered")) { connection?.cancel() }
+                }
             }
         } onCancel: {
             connection.cancel()
@@ -76,8 +84,18 @@ actor WebSocket: Loggable, AsyncSequence {
         fileprivate let connection: NWConnection
 
         func next() async throws -> URLSessionWebSocketTask.Message? {
+            while true {
+                guard let frame = try await receive() else { return nil }
+                if let message = frame { return message }
+                // Not a message: a control frame, or a peer's bare TCP FIN, which arrives without metadata; the next
+                // receive fails on it (ENODATA), so the reconnect starts at once instead of after the ping timeout.
+            }
+        }
+
+        /// nil at the end of the stream, `.some(nil)` for a frame that is not a message.
+        private func receive() async throws -> URLSessionWebSocketTask.Message?? {
             try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URLSessionWebSocketTask.Message?, Error>) in
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URLSessionWebSocketTask.Message??, Error>) in
                     connection.receiveMessage { content, context, _, error in
                         if let error {
                             // A cancelled connection ends the sequence, as a closed URLSession task did.
@@ -86,10 +104,10 @@ actor WebSocket: Loggable, AsyncSequence {
                         }
                         let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata
                         switch metadata?.opcode {
-                        case .binary?: continuation.resume(returning: .data(content ?? Data()))
-                        case .text?: continuation.resume(returning: .string(String(decoding: content ?? Data(), as: UTF8.self)))
-                        case .close?, nil: continuation.resume(returning: nil)
-                        default: continuation.resume(returning: .data(content ?? Data()))
+                        case .binary?: continuation.resume(returning: .some(.data(content ?? Data())))
+                        case .text?: continuation.resume(returning: .some(.string(String(decoding: content ?? Data(), as: UTF8.self))))
+                        case .close?: continuation.resume(returning: nil)
+                        default: continuation.resume(returning: .some(nil))
                         }
                     }
                 }
@@ -130,12 +148,15 @@ actor WebSocket: Loggable, AsyncSequence {
             lock.unlock()
         }
 
-        func resume(_ error: Error?) {
+        /// Whether this was the first outcome, the one the opening got.
+        @discardableResult
+        func resume(_ error: Error?) -> Bool {
             lock.lock()
             let continuation = self.continuation
             self.continuation = nil
             lock.unlock()
             if let error { continuation?.resume(throwing: error) } else { continuation?.resume() }
+            return continuation != nil
         }
     }
 }
