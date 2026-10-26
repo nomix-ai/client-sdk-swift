@@ -20,6 +20,20 @@ import Network
 // The signalling WebSocket over Network.framework instead of URLSession: Foundation keeps every URLSession that ran a
 // WebSocket task, and the task, after it is cancelled and the session invalidated, about 25 KB a connection (macOS 27,
 // iOS 26.5 simulator; a repro without LiveKit leaks the same, an NWConnection does not). Same interface as 2.18.0's.
+/// The peer's close frame, carried as the `internalError` of the thrown ``LiveKitError``.
+struct WebSocketClosedByPeer: Error, Sendable {
+    /// The close code the peer sent; 1005 when it sent none.
+    let code: UInt16
+
+    init(_ code: NWProtocolWebSocket.CloseCode) {
+        self.code = switch code {
+        case let .protocolCode(code): code.rawValue
+        case let .applicationCode(code), let .privateCode(code): code
+        @unknown default: 1005
+        }
+    }
+}
+
 actor WebSocket: Loggable, AsyncSequence {
     typealias Element = URLSessionWebSocketTask.Message
 
@@ -83,31 +97,62 @@ actor WebSocket: Loggable, AsyncSequence {
     struct AsyncIterator: AsyncIteratorProtocol {
         fileprivate let connection: NWConnection
 
+        /// Completions in a row without WebSocket metadata after which the stream counts as gone: a peer's bare TCP FIN
+        /// gives one, and the receive after it fails (ENODATA); more than a few would be a stream that ended unsaid.
+        static let emptyCompletionLimit = 3
+
         func next() async throws -> URLSessionWebSocketTask.Message? {
+            var empty = 0
             while true {
-                guard let frame = try await receive() else { return nil }
-                if let message = frame { return message }
-                // Not a message: a control frame, or a peer's bare TCP FIN, which arrives without metadata; the next
-                // receive fails on it (ENODATA), so the reconnect starts at once instead of after the ping timeout.
+                switch try await receive() {
+                case let .message(message):
+                    return message
+                case .end:
+                    return nil
+                case .control:
+                    empty = 0
+                case .empty:
+                    // A peer's bare TCP FIN arrives without metadata; the next receive fails on it, so the reconnect
+                    // starts at once instead of after the ping timeout.
+                    empty += 1
+                    if empty >= Self.emptyCompletionLimit {
+                        throw LiveKitError(.network, message: "WebSocket ended without a close frame")
+                    }
+                }
             }
         }
 
-        /// nil at the end of the stream, `.some(nil)` for a frame that is not a message.
-        private func receive() async throws -> URLSessionWebSocketTask.Message?? {
+        private enum Frame {
+            case message(URLSessionWebSocketTask.Message)
+            /// Ping or pong: read past.
+            case control
+            /// A completion without WebSocket metadata.
+            case empty
+            /// Our own close.
+            case end
+        }
+
+        private func receive() async throws -> Frame {
             try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URLSessionWebSocketTask.Message??, Error>) in
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Frame, Error>) in
                     connection.receiveMessage { content, context, _, error in
                         if let error {
                             // A cancelled connection ends the sequence, as a closed URLSession task did.
-                            if case .posix(.ECANCELED) = error { return continuation.resume(returning: nil) }
+                            if case .posix(.ECANCELED) = error { return continuation.resume(returning: .end) }
                             return continuation.resume(throwing: LiveKitError(.network, internalError: error))
                         }
                         let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata
-                        switch metadata?.opcode {
-                        case .binary?: continuation.resume(returning: .some(.data(content ?? Data())))
-                        case .text?: continuation.resume(returning: .some(.string(String(decoding: content ?? Data(), as: UTF8.self))))
-                        case .close?: continuation.resume(returning: nil)
-                        default: continuation.resume(returning: .some(nil))
+                        guard let metadata else { return continuation.resume(returning: .empty) }
+                        switch metadata.opcode {
+                        case .binary: continuation.resume(returning: .message(.data(content ?? Data())))
+                        case .text: continuation.resume(returning: .message(.string(String(decoding: content ?? Data(), as: UTF8.self))))
+                        case .close:
+                            // The peer's close fails the stream, so the signal client reconnects at once, as the JS,
+                            // Android and Rust SDKs do; only our own close ends it (upstream PR #1179).
+                            let closed = WebSocketClosedByPeer(metadata.closeCode)
+                            continuation.resume(throwing: LiveKitError(.network, message: "Closed by the peer (\(closed.code))",
+                                                                       internalError: closed))
+                        default: continuation.resume(returning: .control)
                         }
                     }
                 }
